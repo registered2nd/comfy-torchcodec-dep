@@ -1,23 +1,22 @@
-"""Make torchcodec loadable, and say out loud what is on this pod.
+"""Give torchaudio a WAV path that does not go through torchcodec.
 
-torchaudio 2.11+ routes every audio write through torchcodec, and both LatentSync wrappers
-write a temp wav before inference, so lip sync on this deployment stands or falls on
-torchcodec importing. It ships with no FFmpeg of its own: it dlopens libtorchcodec_coreN.so,
-whose libav* dependencies the system loader has to satisfy. The symbol-versioned FFmpeg the
-official wheels accept lives at /opt/ffmpeg7, which is not on the loader path, and setting
-LD_LIBRARY_PATH or patching RPATH both need a shell on the pod.
+From torchaudio 2.11 every `save` and `load` is routed to torchcodec, which has no codecs of
+its own and dlopens FFmpeg's C libraries. This pod carries FFmpeg 8 only (libavutil.so.60,
+libavcodec.so.62) and /opt is empty, so there is no FFmpeg 4-7 for a torchcodec wheel to bind
+to and nothing importable to bind with. Both LatentSync wrappers call `torchaudio.save` to
+write a temporary wav before inference, so lip sync fails at the write step with the model
+loaded and the weights in place.
 
-Loading the libav* objects here with RTLD_GLOBAL does the same job from inside the process:
-once they are resolved globally, the loader satisfies libtorchcodec_core's dependencies from
-what is already mapped. This module is imported by ComfyUI at startup, which is before any
-prompt runs and therefore before torchaudio first reaches for torchcodec.
+A wav needs no codec. This replaces `save` and `load` with the standard library's `wave`
+module for wav paths only, and defers to the original implementation for every other format,
+so the patch can only turn an exception into a working call and never changes a path that
+already worked. ComfyUI imports this at startup, before any prompt runs.
 
 Registers no nodes. Everything it prints goes to /internal/logs/raw.
 """
-import ctypes
-import glob
 import os
 import sys
+import wave
 
 TAG = "[torchcodec-dep]"
 
@@ -26,68 +25,76 @@ def _say(msg):
     print(f"{TAG} {msg}", flush=True)
 
 
-def _report():
-    _say(f"python={sys.version.split()[0]} exe={sys.executable}")
-    try:
-        import torch
-        _say(f"torch={torch.__version__}")
-    except Exception as e:
-        _say(f"torch import failed: {e}")
-    for p in ("/opt", "/root/ComfyUI/user"):
-        try:
-            _say(f"ls {p} -> {sorted(os.listdir(p))[:40]}")
-        except Exception as e:
-            _say(f"ls {p} failed: {e}")
-    for pat in ("/opt/*/lib/libav*.so*", "/usr/lib64/libav*.so*", "/usr/lib/libav*.so*",
-                "/usr/local/lib/libav*.so*", "/usr/lib64/libsw*.so*"):
-        hits = sorted(glob.glob(pat))
-        if hits:
-            _say(f"{pat} -> {[os.path.basename(h) for h in hits][:20]}")
-    for mod in ("torchcodec",):
-        try:
-            m = __import__(mod)
-            _say(f"{mod} at {getattr(m, '__file__', '?')}")
-        except Exception as e:
-            _say(f"{mod} not importable yet: {type(e).__name__}: {str(e)[:200]}")
+def _is_wav(uri):
+    return isinstance(uri, (str, os.PathLike)) and str(uri).lower().endswith(".wav")
 
 
-# libavutil underpins everything else, and libavformat depends on codec/swresample, so the
-# load order is not arbitrary - a dependency loaded second is a dependency the loader has
-# already failed to find once.
-_ORDER = ("libavutil", "libswresample", "libswscale", "libavcodec", "libavformat",
-          "libavfilter", "libavdevice")
+def _patch():
+    import numpy as np
+    import torch
+    import torchaudio
+
+    orig_save, orig_load = torchaudio.save, torchaudio.load
+
+    def save(uri, src, sample_rate, channels_first=True, format=None, **kw):
+        if not _is_wav(uri) or format not in (None, "wav"):
+            return orig_save(uri, src, sample_rate, channels_first=channels_first,
+                             format=format, **kw)
+        x = src.detach().cpu()
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        if not channels_first:
+            x = x.transpose(0, 1)
+        # float tensors are [-1, 1]; clamp before scaling or a hot sample wraps to the
+        # opposite polarity and the mouth gets driven by a click.
+        if x.is_floating_point():
+            x = (x.clamp(-1.0, 1.0) * 32767.0).round().to(torch.int16)
+        else:
+            x = x.to(torch.int16)
+        data = x.transpose(0, 1).contiguous().numpy().astype("<i2")
+        with wave.open(str(uri), "wb") as w:
+            w.setnchannels(int(x.shape[0]))
+            w.setsampwidth(2)
+            w.setframerate(int(sample_rate))
+            w.writeframes(data.tobytes())
+        return None
+
+    def load(uri, *a, channels_first=True, **kw):
+        if not _is_wav(uri):
+            return orig_load(uri, *a, channels_first=channels_first, **kw)
+        with wave.open(str(uri), "rb") as r:
+            ch, width, rate, n = r.getnchannels(), r.getsampwidth(), r.getframerate(), r.getnframes()
+            raw = r.readframes(n)
+        if width != 2:
+            return orig_load(uri, *a, channels_first=channels_first, **kw)
+        arr = np.frombuffer(raw, dtype="<i2").reshape(-1, ch).astype("float32") / 32768.0
+        t = torch.from_numpy(arr.copy())
+        return (t.transpose(0, 1).contiguous() if channels_first else t), rate
+
+    torchaudio.save, torchaudio.load = save, load
+    _say(f"torchaudio {torchaudio.__version__} save/load patched for wav via stdlib wave")
 
 
-def _preload():
-    roots = sorted(glob.glob("/opt/ffmpeg*/lib")) + ["/usr/local/lib", "/usr/lib64", "/usr/lib"]
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
-        loaded, failed = [], []
-        for stem in _ORDER:
-            for path in sorted(glob.glob(os.path.join(root, f"{stem}.so.*"))):
-                try:
-                    ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-                    loaded.append(os.path.basename(path))
-                    break
-                except OSError as e:
-                    failed.append(f"{os.path.basename(path)}: {str(e)[:80]}")
-        if loaded:
-            _say(f"preloaded from {root}: {loaded}")
-            if failed:
-                _say(f"  skipped: {failed[:6]}")
-            return root
-    _say("no libav* preloaded from any candidate root")
-    return None
-
-
-_report()
-_preload()
 try:
-    from torchcodec.encoders import AudioEncoder  # noqa: F401
-    _say("torchcodec.encoders.AudioEncoder OK - torchaudio.save will work")
+    _patch()
 except Exception as e:
-    _say(f"torchcodec still failing: {type(e).__name__}: {str(e)[:600]}")
+    _say(f"patch failed: {type(e).__name__}: {e}")
+
+# Prove it round-trips here rather than discovering it inside a 12-minute render.
+try:
+    import tempfile
+
+    import torch
+    import torchaudio
+    p = os.path.join(tempfile.gettempdir(), "torchcodec_dep_selftest.wav")
+    sig = torch.sin(torch.arange(16000, dtype=torch.float32) * 0.05).unsqueeze(0) * 0.5
+    torchaudio.save(p, sig, 16000)
+    back, sr = torchaudio.load(p)
+    err = (back - sig).abs().max().item()
+    _say(f"self-test: wrote+read {back.shape} at {sr} Hz, max error {err:.5f}")
+    os.remove(p)
+except Exception as e:
+    _say(f"self-test FAILED: {type(e).__name__}: {e}")
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
